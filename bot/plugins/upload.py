@@ -1,8 +1,10 @@
 import os
 import time
+import string
+import random
 import datetime
 
-from pyrogram import Filters
+from pyrogram import Filters, InlineKeyboardMarkup, InlineKeyboardButton
 
 from ..translations import Messages as tr
 from ..helpers.downloader import Downloader
@@ -17,42 +19,59 @@ from ..utubebot import UtubeBot
     & Filters.command('upload') 
     & Filters.user(Config.AUTH_USERS)
 )
-async def _upload(c, m):
+def _upload(c, m):
     if not os.path.exists(Config.CRED_FILE):
-        await m.reply_text(tr.NOT_AUTHENTICATED_MSG, True)
+        m.reply_text(tr.NOT_AUTHENTICATED_MSG, True)
         return
 
     if not m.reply_to_message:
-        await m.reply_text(tr.NOT_A_REPLY_MSG, True)
+        m.reply_text(tr.NOT_A_REPLY_MSG, True)
         return
 
     message = m.reply_to_message
 
     if not message.media:
-        await m.reply_text(tr.NOT_A_MEDIA_MSG, True)
+        m.reply_text(tr.NOT_A_MEDIA_MSG, True)
         return
 
     if not valid_media(message):
-        await m.reply_text(tr.NOT_A_VALID_MEDIA_MSG, True)
+        m.reply_text(tr.NOT_A_VALID_MEDIA_MSG, True)
         return
+    
+    if c.counter >= 6:
+        m.reply_text(tr.DAILY_QOUTA_REACHED, True)
 
-    snt = await m.reply_text(tr.PROCESSING, True)
+    snt = m.reply_text(tr.PROCESSING, True)
+    c.counter += 1
+    download_id = get_download_id(c.download_controller)
+    c.download_controller[download_id] = True
 
     download = Downloader(m)
-
-    status, file = await download.start(progress, snt)
-
+    status, file = download.start(progress, snt, c, download_id)
+    c.download_controller.pop(download_id)
+    
     if not status:
-        await snt.edit_text(text = file, parse_mode='markdown')
+        c.counter -= 1
+        c.counter = max(0, c.counter)
+        snt.edit_text(text = file, parse_mode='markdown')
         return
-
+    time.sleep(5)
+    snt.edit_text("Downloaded to local, Now starting to upload to youtube...")
     title = ' '.join(m.command[1:])
-
     upload = Uploader(file, title)
+    status, link = upload.start(progress, snt)
+    if not status:
+        c.counter -= 1
+        c.counter = max(0, c.counter)
+    snt.edit_text(text = link, parse_mode='markdown')
 
-    status, link = await upload.start(progress, snt)
 
-    await snt.edit_text(text = link, parse_mode='markdown')
+def get_download_id(storage):
+    while True:
+        download_id = ''.join([random.choice(string.ascii_letters) for i in range(3)])
+        if download_id not in storage:
+            break
+    return download_id
 
 
 def valid_media(media):
@@ -68,24 +87,43 @@ def valid_media(media):
         return False
 
 
-async def progress(cur, tot, start_time, status, snt):
+def human_bytes(num, split=False):
+    base = 1024.0
+    sufix_list = ['B','KB','MB','GB','TB','PB','EB','ZB', 'YB']
+    for unit in sufix_list:
+        if abs(num) < base:
+            if split:
+                return round(num, 2), unit
+            return f"{round(num, 2)} {unit}"
+        num /= base
+
+
+def progress(cur, tot, start_time, status, snt, c, download_id):
+    if not c.download_controller.get(download_id):
+        raise c.StopTransmission
+        
     try:
         diff = int(time.time()-start_time)
         
-        if diff % 2 == 0:
-            speed = round((cur/(1024**2))/diff,2)
-
-            curr = round(cur/(1024**2), 2)
-
-            tott = round(tot/(1024**2), 2)
-
+        if (int(time.time()) % 5 == 0) or (cur==tot):
+            time.sleep(1)
+            speed, unit = human_bytes(cur/diff, True)
+            curr = human_bytes(cur)
+            tott = human_bytes(tot)
             eta = datetime.timedelta(seconds=int(((tot-cur)/(1024*1024))/speed))
-
-            progress = round((cur * 100) / tot,2)
-
-            text = f"**{status}**\n\n`{progress}%` done.\n**{curr}MB** of **{tott}MB**\nSpeed: **{speed}MBPS**\nETA: **{eta}**"
-
-            await snt.edit_text(text = text)
+            elapsed = datetime.timedelta(seconds=diff)
+            progress = round((cur * 100) / tot, 2)
+            text = f"{status}\n\n{progress}% done.\n{curr} of {tott}\nSpeed: {speed} {unit}PS\nETA: {eta}\nElapsed: {elapsed}"
+            snt.edit_text(
+                text = text, 
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton('Cancel!', f'cncl+{download_id}')
+                        ]
+                    ]
+                )
+            )
 
     except Exception as e:
         print(e)
